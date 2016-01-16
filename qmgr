@@ -1,0 +1,296 @@
+#! /bin/bash
+
+##################################
+### SETTINGS #####################
+##################################
+
+# Network Bridge Settings
+BRIFACE="br0"
+BRNET="192.168.100.0/24"
+BRIP="192.168.100.1/24"
+
+# Root store
+ROOT="/extra"
+
+# Disk Image Settings
+IMGSTORE="$ROOT/vdisks"
+IMGFORMAT="qcow2"
+
+# Launch VM Settings
+VMXSTORE="$ROOT/vm_configs"
+
+
+
+##################################
+### BRIDGE (HOST-ONLY NETWORK) ###
+##################################
+
+new_bridge(){
+  # Check if bridge exists
+  ip link show dev $BRIFACE > /dev/null 2>&1; BRUP=$(echo -n $?)
+  if [ "$BRUP" = "0" ]
+   then echo "Bridge is already up."; exit 1
+  fi
+
+  # Check where do we get internet connection from
+  read INETIF < <(netstat -nr | grep ^'0.0.0.0' | awk '{ print $8 }')
+
+  # Create bridge
+  ip link add name $BRIFACE type bridge
+
+  # Add ip address to the bridge
+  ip addr add $BRIP dev $BRIFACE
+
+  # Make the bridge online
+  ip link set dev $BRIFACE up
+
+  # Cleanup iptables
+  iptables -F
+  iptables -t nat -F
+  iptables -t mangle -F
+
+  # Enable NAT & DHCP/DNS
+  iptables -A INPUT -i lo -j ACCEPT
+  iptables -A INPUT -m state --state RELATED,ESTABLISHED -j ACCEPT
+  iptables -A INPUT -i br0 -j ACCEPT
+  iptables -P INPUT DROP
+  iptables -P FORWARD DROP
+  iptables -t nat -A POSTROUTING -o $INETIF -s $BRNET -j MASQUERADE
+  iptables -A FORWARD -i br0 -o $INETIF -j ACCEPT
+  iptables -A FORWARD -i $INETIF -o br0 -m state --state RELATED,ESTABLISHED -j ACCEPT
+  iptables -A FORWARD -i br0 -o br0 -s $BRNET -d $BRNET -j ACCEPT
+  echo 1 > /proc/sys/net/ipv4/ip_forward
+  service dnsmasq start
+}
+
+###############################END
+
+##################################
+### CREATE DISK IMAGE ############
+##################################
+new_image(){
+  # Name
+  if [ -z "$1"  ]
+    then read -p "Disk image file name: " IMGNAME
+  else
+    IMGNAME="$1"
+  fi
+  
+  # Size
+  if [ -z "$2" ]
+    then read -p "Disk image size (specify unit): " IMGSIZE && [ -z "$IMGSIZE" ] && echo "I need the disk size!" && exit 1
+  else
+    IMGSIZE="$2"
+  fi
+
+  qemu-img create -f "$IMGFORMAT" "$IMGSTORE"/"$IMGNAME".img "$IMGSIZE"
+
+}
+###############################END
+
+##################################
+### LIST VMS #####################
+##################################
+list_vm(){
+  echo "Available VMs:"
+  \ls -1U "$VMXSTORE" | sed -e 's/.vmx//g'
+}
+###############################END
+
+##################################
+### CREATE VM ####################
+##################################
+new_vm(){
+  if [ -z "$1" ]
+    then
+      read -p "New VM name: " VMNAME && [ -z "$VMNAME" ] && echo "Please retry and put a VM name" && exit 1
+    else
+      VMNAME="$1"
+  fi
+
+  if [ -z "$2" ]
+    then
+      IMGSIZE="$2"
+  fi
+
+  # Verify if VM exists
+  \ls -1U "$VMXSTORE"/"$VMNAME".vmx &> /dev/null && echo "VM already exists, please use another name" && exit 1 
+
+  # Create disk
+  new_image "$VMNAME" "$IMGSIZE"
+
+  # Generate and load MAC
+  MAC=$(printf 'DE:AD:BE:%02X:%02X:%02X\n' $[RANDOM%256] $[RANDOM%256] $[RANDOM%256])
+
+  # Create VM
+  cat > "$VMXSTORE"/"$VMNAME".vmx << "EOF"
+MACHINE="q35"
+CPU="host -enable-kvm"
+SMP="cpus=2"
+RAM="1024"
+HOSTNET="bridge"
+GUESTMAC="$MAC"
+GUESTNET="nic,model=virtio,macaddr=$GUESTMAC"
+vncdisplay="XX"
+EOF
+}
+###############################END
+
+##################################
+### DELETE VM ####################
+##################################
+rm_vm(){
+  if [ -z "$1" ]
+    then
+      list_vm
+      read -p "VM to delete: " VMNAME
+    else
+      VMNAME="$1"
+  fi
+
+  rm -f "$VMXSTORE"/"$VMNAME".vmx "$IMGSTORE"/"$VMNAME".img
+}
+###############################END
+
+##################################
+### CLONE VM #####################
+##################################
+clone_vm(){
+  if [ -z "$1" ]
+    then
+      list_vm
+      read -p "VM to clone from: " VMORIGIN && [ -z "$VMORIGIN" ] && echo "I can't clone a VM from air, name please?" && exit 1
+    else
+      VMORIGIN="$1"
+  fi
+  if [ -z "$2" ]
+    then
+      read -p "Name for the new VM: " VMNAME && [ -z "$VMNAME" ] && echo "Destination nowhere... name for the new VM?" && exit 1
+    else
+      VMNAME="$2"
+  fi
+  
+  echo "Copying..."
+  # Copy disk image
+  cp -a "$IMGSTORE"/"$VMORIGIN".img "$IMGSTORE"/"$VMNAME".img
+  # New MAC
+  MAC=$(printf 'DE:AD:BE:%02X:%02X:%02X\n' $[RANDOM%256] $[RANDOM%256] $[RANDOM%256])
+  cat "$VMXSTORE"/"$VMORIGIN".vmx | sed "s/^GUESTMAC.*$/GUESTMAC=\"$MAC\"/" > "$VMXSTORE"/"$VMNAME".vmx
+  echo "...done."
+}
+###############################END
+
+##################################
+### LAUNCH VM ####################
+##################################
+start_vm(){
+  # VM name
+  if [ -z "$1" ]
+    then
+      list_vm
+      read -p "VM to start: " VMNAME
+  else
+    VMNAME="$1"
+  fi
+
+  # Is there any vm with the same name running?
+  ISRUNNING=`ps -ef | grep -v -e 'grep' -e 'qmgr' | grep -c $VMNAME`
+  if [ "$ISRUNNING" != "0" ]
+    then echo "VM $VMNAME is already running"; exit 1
+  fi
+
+  # Is launching with ISO image?
+  if [ -n "$2" ]
+    then BOOTCD="-drive file=$(echo $2 | sed -e 's/bootcd=//'),media=cdrom"
+  fi
+
+  # Get config
+  source "$VMXSTORE"/"$VMNAME".vmx || ( echo "VM configuration file not found" && exit 1 )
+  qemu-system-x86_64 "$IMGSTORE"/"$VMNAME.img" -name "$VMNAME",process="$VMNAME" -machine $MACHINE -cpu $CPU -smp $SMP -m $RAM -net $HOSTNET -net $GUESTNET -display vnc=127.0.0.1:"$vncdisplay"  $DEVICES $BOOTCD &
+
+}
+###############################END
+
+##################################
+### LAUNCH VM ####################
+##################################
+show_vm_config(){
+  # VM name
+  if [ -z "$1" ]
+    then
+      list_vm
+      read -p "VM to show: " VMNAME
+  else
+    VMNAME="$1"
+  fi
+
+  echo "$VMNAME configuration:"
+  cat "$VMXSTORE"/"$VMNAME".vmx
+
+}
+###############################END
+
+##################################
+### CONNECT VM VNC ###############
+##################################
+vm_connect_vnc(){
+  if [ -z "$1" ]
+    then
+    list_vm
+    read -p "VM to connect to: " VMNAME 
+  else
+    VMNAME="$1"
+  fi
+
+  source "$VMXSTORE"/"$VMNAME".vmx
+  vncviewer localhost:"$vncdisplay"
+}
+##################################
+
+##################################
+### SCRIPT CONTROL ###############
+##################################
+case "$1" in
+
+  start-bridge)
+    shift
+    new_bridge
+    service lighttpd start ;;
+
+  new-image)
+    shift
+    new_image "$1" "$2" ;;
+  
+  list-vm)
+    shift
+    list_vm ;;
+
+  new-vm)
+    shift
+    new_vm "$1" "$2" ;;
+
+  rm-vm)
+    shift
+    rm_vm "$1" ;;
+
+  clone-vm)
+    shift
+    clone_vm "$1" "$2" ;;
+
+  start-vm)
+    shift
+    start_vm "$1" "$2" ;;
+
+  show-vm-config)
+    shift
+    show_vm_config "$1" ;;
+
+  vnc)
+    shift
+    vm_connect_vnc "$1" ;;
+
+  *)
+  echo -e "WIP\nstart-bridge\nnew-image\nlist-vm\nnew-vm\nrm-vm\nclone-vm\nstart-vm\nshow-vm-config\nvnc" ;;
+
+esac
+##################################
