@@ -206,7 +206,7 @@ start_vm(){
 
   # Get config
   source "$VMXSTORE"/"$VMNAME".vmx || ( echo "VM configuration file not found" && exit 1 )
-  qemu-system-x86_64 "$IMGSTORE"/"$VMNAME.img" -name "$VMNAME",process="$VMNAME" -machine $MACHINE -cpu $CPU -smp $SMP -m $RAM -net $HOSTNET -net $GUESTNET -display vnc=127.0.0.1:"$vncdisplay"  $DEVICES $BOOTCD &
+  qemu-system-x86_64 -drive file=$IMGSTORE/$VMNAME.img,if=virtio -name "$VMNAME",process="$VMNAME" -machine $MACHINE -cpu $CPU -smp $SMP -m $RAM -net $HOSTNET -net $GUESTNET -display vnc=127.0.0.1:"$vncdisplay"  $DEVICES $BOOTCD &
 
 }
 ###############################END
@@ -243,7 +243,7 @@ vm_connect_vnc(){
   fi
 
   source "$VMXSTORE"/"$VMNAME".vmx
-  vncviewer localhost:"$vncdisplay"
+  vncviewer localhost:"$vncdisplay" &
 }
 ##################################
 
